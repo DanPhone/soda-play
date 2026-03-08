@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SodaPlay Prototype</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #111;
+      color: #e8e8e8;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      overflow: hidden;
+    }
+    #ui {
+      position: fixed;
+      left: 12px;
+      top: 10px;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 10px 12px;
+      line-height: 1.35;
+      font-size: 13px;
+      pointer-events: none;
+      white-space: pre-line;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="ui"></div>
+
+  <script>
+    // --- Canvas setup --------------------------------------------------------
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const ui = document.getElementById('ui');
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- Physics parameters --------------------------------------------------
+    const gravity = 1100;      // px/s^2
+    const airDamping = 0.995;  // per-step velocity damping
+    const groundYRatio = 0.82; // floor relative to canvas height
+    const floorBounce = 0.0;
+    const groundFriction = 0.82;
+    const dtFixed = 1 / 120;   // physics step
+    const maxSubSteps = 5;
+    const rodIterations = 8;
+
+    // --- World state ---------------------------------------------------------
+    const nodes = [];
+    const springs = [];
+    let running = true;
+    let simTime = 0;
+
+    // Mouse/editor state
+    const mouse = { x: 0, y: 0, down: false };
+    let dragStartNode = null;
+    let hoverNode = null;
+    let hoverSpring = null;
+
+    // --- Utility -------------------------------------------------------------
+    function dist(ax, ay, bx, by) {
+      const dx = bx - ax;
+      const dy = by - ay;
+      return Math.hypot(dx, dy);
+    }
+
+    function pointSegmentDistance(px, py, ax, ay, bx, by) {
+      const abx = bx - ax;
+      const aby = by - ay;
+      const apx = px - ax;
+      const apy = py - ay;
+      const abLenSq = abx * abx + aby * aby;
+      const t = abLenSq > 0 ? Math.max(0, Math.min(1, (apx * abx + apy * aby) / abLenSq)) : 0;
+      const cx = ax + abx * t;
+      const cy = ay + aby * t;
+      return Math.hypot(px - cx, py - cy);
+    }
+
+    function getGroundY() {
+      return canvas.height * groundYRatio;
+    }
+
+    function findNodeAt(x, y, radius = 16) {
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        if (dist(x, y, n.x, n.y) <= radius) return n;
+      }
+      return null;
+    }
+
+    function findNearestSpring(x, y, maxDist = 12) {
+      let best = null;
+      let bestD = maxDist;
+      for (const s of springs) {
+        const a = nodes[s.a];
+        const b = nodes[s.b];
+        const d = pointSegmentDistance(x, y, a.x, a.y, b.x, b.y);
+        if (d < bestD) {
+          bestD = d;
+          best = s;
+        }
+      }
+      return best;
+    }
+
+    // --- Core data creation --------------------------------------------------
+    function createNode(x, y, mass = 1.0, radius = 8) {
+      const n = {
+        x, y,
+        vx: 0,
+        vy: 0,
+        fx: 0,
+        fy: 0,
+        mass,
+        invMass: mass > 0 ? 1 / mass : 0,
+        radius,
+        prevX: x,
+        prevY: y
+      };
+      nodes.push(n);
+      return nodes.length - 1;
+    }
+
+    function createSpring(a, b, stiffness = 220, damping = 4, opts = {}) {
+      const n1 = nodes[a];
+      const n2 = nodes[b];
+      const baseLen = dist(n1.x, n1.y, n2.x, n2.y);
+      const s = {
+        a,
+        b,
+        baseLen,
+        stiffness,
+        damping,
+        muscle: !!opts.muscle,
+        amplitude: opts.amplitude || 0,
+        frequency: opts.frequency || 0,
+        phase: opts.phase || 0,
+        rod: !!opts.rod
+      };
+      springs.push(s);
+      return s;
+    }
+
+    // --- Initial SodaPlay-inspired creature ---------------------------------
+    function spawnCreature() {
+      const ox = 230;
+      const oy = 180;
+
+      const n0 = createNode(ox + 0, oy + 0, 1.2);     // body top-left
+      const n1 = createNode(ox + 95, oy + 0, 1.2);    // body top-right
+      const n2 = createNode(ox + 0, oy + 55, 1.4);    // hip-left
+      const n3 = createNode(ox + 95, oy + 55, 1.4);   // hip-right
+      const n4 = createNode(ox - 15, oy + 120, 1.1);  // foot-left
+      const n5 = createNode(ox + 110, oy + 120, 1.1); // foot-right
+
+      // Body frame (mostly rigid via rods + springs)
+      createSpring(n0, n1, 360, 5, { rod: true });
+      createSpring(n2, n3, 360, 5, { rod: true });
+      createSpring(n0, n2, 260, 5, { rod: true });
+      createSpring(n1, n3, 260, 5, { rod: true });
+      createSpring(n0, n3, 220, 5);
+      createSpring(n1, n2, 220, 5);
+
+      // Legs / tendons
+      createSpring(n2, n4, 260, 4, { muscle: true, amplitude: 18, frequency: 6.0, phase: 0.0 });
+      createSpring(n3, n5, 260, 4, { muscle: true, amplitude: 18, frequency: 6.0, phase: Math.PI });
+      createSpring(n0, n4, 150, 3, { muscle: true, amplitude: 10, frequency: 6.0, phase: Math.PI * 0.5 });
+      createSpring(n1, n5, 150, 3, { muscle: true, amplitude: 10, frequency: 6.0, phase: Math.PI * 1.5 });
+
+      createSpring(n4, n5, 80, 2);
+      createSpring(n2, n5, 110, 2);
+      createSpring(n3, n4, 110, 2);
+    }
+
+    // --- Physics step --------------------------------------------------------
+    function springRestLength(s, t) {
+      if (!s.muscle) return s.baseLen;
+      return s.baseLen + s.amplitude * Math.sin(t * s.frequency + s.phase);
+    }
+
+    function applyForces(dt) {
+      // Reset forces to gravity.
+      for (const n of nodes) {
+        n.fx = 0;
+        n.fy = n.mass * gravity;
+      }
+
+      // Spring-damper forces.
+      for (const s of springs) {
+        if (s.rod) continue; // rods handled with constraint projection
+
+        const a = nodes[s.a];
+        const b = nodes[s.b];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len = Math.hypot(dx, dy);
+        if (len < 1e-6) len = 1e-6;
+
+        const nx = dx / len;
+        const ny = dy / len;
+
+        const rest = springRestLength(s, simTime);
+        const extension = len - rest;
+
+        // Hooke's law
+        const fs = s.stiffness * extension;
+
+        // Damping along spring axis
+        const rvx = b.vx - a.vx;
+        const rvy = b.vy - a.vy;
+        const relVelAlong = rvx * nx + rvy * ny;
+        const fd = s.damping * relVelAlong;
+
+        const force = fs + fd;
+        const fx = force * nx;
+        const fy = force * ny;
+
+        a.fx += fx;
+        a.fy += fy;
+        b.fx -= fx;
+        b.fy -= fy;
+      }
+
+      // Integrate velocities and positions.
+      for (const n of nodes) {
+        n.vx += (n.fx * n.invMass) * dt;
+        n.vy += (n.fy * n.invMass) * dt;
+
+        n.vx *= airDamping;
+        n.vy *= airDamping;
+
+        n.prevX = n.x;
+        n.prevY = n.y;
+
+        n.x += n.vx * dt;
+        n.y += n.vy * dt;
+      }
+    }
+
+    function solveRodConstraints(dt) {
+      for (let iter = 0; iter < rodIterations; iter++) {
+        for (const s of springs) {
+          if (!s.rod) continue;
+          const a = nodes[s.a];
+          const b = nodes[s.b];
+
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let len = Math.hypot(dx, dy);
+          if (len < 1e-6) len = 1e-6;
+
+          const diff = (len - s.baseLen) / len;
+          const w1 = a.invMass;
+          const w2 = b.invMass;
+          const wsum = w1 + w2;
+          if (wsum === 0) continue;
+
+          const corrX = dx * diff;
+          const corrY = dy * diff;
+
+          a.x += corrX * (w1 / wsum);
+          a.y += corrY * (w1 / wsum);
+          b.x -= corrX * (w2 / wsum);
+          b.y -= corrY * (w2 / wsum);
+        }
+
+        // keep constrained nodes above ground each iteration for stability
+        const groundY = getGroundY();
+        for (const n of nodes) {
+          const minY = groundY - n.radius;
+          if (n.y > minY) n.y = minY;
+        }
+      }
+
+      // Velocity correction from projected positions
+      for (const n of nodes) {
+        n.vx = (n.x - n.prevX) / dt;
+        n.vy = (n.y - n.prevY) / dt;
+      }
+    }
+
+    function resolveGroundCollision() {
+      const groundY = getGroundY();
+      for (const n of nodes) {
+        const minY = groundY - n.radius;
+        if (n.y > minY) {
+          n.y = minY;
+          if (n.vy > 0) n.vy *= -floorBounce;
+
+          // Friction when touching ground
+          n.vx *= groundFriction;
+
+          // small threshold to avoid jitter
+          if (Math.abs(n.vy) < 2) n.vy = 0;
+        }
+      }
+    }
+
+    function physicsStep(dt) {
+      applyForces(dt);
+      solveRodConstraints(dt);
+      resolveGroundCollision();
+      simTime += dt;
+    }
+
+    // --- Rendering -----------------------------------------------------------
+    function drawBackground() {
+      ctx.fillStyle = '#15171b';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const gy = getGroundY();
+      ctx.fillStyle = '#2b2e35';
+      ctx.fillRect(0, gy, canvas.width, canvas.height - gy);
+
+      ctx.strokeStyle = '#6d7380';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, gy + 0.5);
+      ctx.lineTo(canvas.width, gy + 0.5);
+      ctx.stroke();
+    }
+
+    function drawSprings() {
+      for (const s of springs) {
+        const a = nodes[s.a];
+        const b = nodes[s.b];
+
+        if (s.rod) {
+          ctx.strokeStyle = '#74c69d';
+          ctx.lineWidth = 2.5;
+        } else if (s.muscle) {
+          ctx.strokeStyle = '#ff7b72';
+          ctx.lineWidth = 3;
+        } else {
+          ctx.strokeStyle = '#8fb3ff';
+          ctx.lineWidth = 2;
+        }
+
+        if (s === hoverSpring) {
+          ctx.lineWidth += 1.5;
+          ctx.strokeStyle = '#ffd166';
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+
+    function drawNodes() {
+      for (const n of nodes) {
+        ctx.fillStyle = '#eaeef7';
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = '#111';
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+      }
+
+      if (hoverNode) {
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(hoverNode.x, hoverNode.y, hoverNode.radius + 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    function drawEditorPreview() {
+      if (dragStartNode && mouse.down) {
+        ctx.strokeStyle = '#ffd166';
+        ctx.setLineDash([6, 5]);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(dragStartNode.x, dragStartNode.y);
+        ctx.lineTo(mouse.x, mouse.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    function draw() {
+      drawBackground();
+      drawSprings();
+      drawNodes();
+      drawEditorPreview();
+
+      ui.textContent = [
+        `Space: ${running ? 'Pause' : 'Run'} simulation`,
+        'Click empty space: create node',
+        'Drag node -> node: create spring',
+        'M: toggle nearest spring muscle',
+        `Nodes: ${nodes.length}  Springs: ${springs.length}`,
+        `Time: ${simTime.toFixed(2)}s`
+      ].join('\n');
+    }
+
+    // --- Interaction ---------------------------------------------------------
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouse.x = e.clientX - rect.left;
+      mouse.y = e.clientY - rect.top;
+      hoverNode = findNodeAt(mouse.x, mouse.y, 14);
+      hoverSpring = findNearestSpring(mouse.x, mouse.y, 10);
+    });
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      mouse.down = true;
+      const n = findNodeAt(mouse.x, mouse.y, 14);
+      if (n) {
+        dragStartNode = n;
+      } else {
+        createNode(mouse.x, mouse.y, 1.0);
+      }
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return;
+      mouse.down = false;
+
+      if (dragStartNode) {
+        const endNode = findNodeAt(mouse.x, mouse.y, 14);
+        if (endNode && endNode !== dragStartNode) {
+          const a = nodes.indexOf(dragStartNode);
+          const b = nodes.indexOf(endNode);
+
+          // avoid duplicate exact same-direction springs
+          const exists = springs.some(s => (s.a === a && s.b === b) || (s.a === b && s.b === a));
+          if (!exists) {
+            createSpring(a, b, 220, 4);
+          }
+        }
+      }
+
+      dragStartNode = null;
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        running = !running;
+      }
+
+      if (e.code === 'KeyM') {
+        const s = findNearestSpring(mouse.x, mouse.y, 14);
+        if (s) {
+          s.muscle = !s.muscle;
+          if (s.muscle) {
+            // reasonable default oscillation settings when converting
+            s.amplitude = s.amplitude || Math.max(6, s.baseLen * 0.12);
+            s.frequency = s.frequency || 6.0;
+            s.phase = s.phase || 0;
+          }
+        }
+      }
+    });
+
+    // --- Main loop -----------------------------------------------------------
+    let lastTime = performance.now();
+    let accumulator = 0;
+
+    function frame(now) {
+      const dt = Math.min(0.033, (now - lastTime) / 1000);
+      lastTime = now;
+
+      if (running) {
+        accumulator += dt;
+        let steps = 0;
+        while (accumulator >= dtFixed && steps < maxSubSteps) {
+          physicsStep(dtFixed);
+          accumulator -= dtFixed;
+          steps++;
+        }
+      }
+
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    spawnCreature();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
